@@ -9,6 +9,7 @@ import sys
 import threading
 from typing import Optional, Tuple
 from pathlib import Path
+from urllib.parse import unquote
 
 README='''
 # ---------------------------------------------------------------------------
@@ -16,9 +17,15 @@ README='''
 #
 # This script:
 #   - Ensures ./http/index.html exists
-#   - Ensures ./certs/README.txt exists
+#   - Ensures ./certs exists
+#   - Ensures ./downloads exists
 #   - Optionally runs HTTP and/or HTTPS servers
 #
+# Downloads:
+#   Place files in ./downloads and download via:
+#     http(s)://<host>/downloads/<filename>
+#   Directory listing:
+#     http(s)://<host>/downloads/
 # ---------------------------------------------------------------------------
 # RUN MODES
 # ---------------------------------------------------------------------------
@@ -74,9 +81,10 @@ WEB_DIR = Path("./http")
 INDEX_FILE = WEB_DIR / "index.html"
 
 CERT_DIR = Path("./certs")
-
 DEFAULT_CERT_FILE = CERT_DIR / "full_chain.crt"
 DEFAULT_KEY_FILE = CERT_DIR / "private_key.key"
+
+DOWNLOADS_DIR = Path("./downloads")
 
 DEFAULT_HTTP_PORT = 80
 DEFAULT_HTTPS_PORT = 443
@@ -106,15 +114,8 @@ INDEX_CONTENT = """<!DOCTYPE html>
             text-align: center;
             max-width: 500px;
         }
-        h1 {
-            margin-top: 0;
-            color: #4CAF50;
-        }
-        .info {
-            margin-top: 20px;
-            font-size: 0.9em;
-            color: #bbb;
-        }
+        h1 { margin-top: 0; color: #4CAF50; }
+        .info { margin-top: 20px; font-size: 0.9em; color: #bbb; }
         button {
             margin-top: 25px;
             padding: 10px 20px;
@@ -124,15 +125,18 @@ INDEX_CONTENT = """<!DOCTYPE html>
             color: white;
             cursor: pointer;
         }
-        button:hover {
-            background: #43a047;
-        }
+        button:hover { background: #43a047; }
+        a { color: #7dd3fc; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Service Online</h1>
         <p>The web service is reachable and responding.</p>
+
+        <p>
+            Downloads: <a href="/downloads/">/downloads/</a>
+        </p>
 
         <button onclick="location.reload()">Reload</button>
 
@@ -179,6 +183,8 @@ def ensure_structure(overwrite: bool) -> None:
     ensure_file(INDEX_FILE, INDEX_CONTENT, overwrite=overwrite)
 
     ensure_dir(CERT_DIR)
+    ensure_dir(DOWNLOADS_DIR)
+
 
 def validate_https_files(cert_path: Path, key_path: Path) -> None:
     if not cert_path.exists() or not key_path.exists():
@@ -192,52 +198,76 @@ def validate_https_files(cert_path: Path, key_path: Path) -> None:
         raise FileNotFoundError("Missing HTTPS certificate or key")
 
 
+class RootedHandler(http.server.SimpleHTTPRequestHandler):
+    """
+    Serve:
+      - /... from WEB_DIR
+      - /downloads/... from DOWNLOADS_DIR
+
+    Both are "jailed" to their respective directories to avoid ../ traversal.
+    """
+
+    # We'll set these at runtime before starting each server thread
+    web_root: Path = WEB_DIR.resolve()
+    downloads_root: Path = DOWNLOADS_DIR.resolve()
+
+    def translate_path(self, path: str) -> str:
+        # Strip query/fragment and URL-decode
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        path = unquote(path)
+
+        # Route /downloads to DOWNLOADS_DIR, everything else to WEB_DIR
+        if path == "/downloads" or path.startswith("/downloads/"):
+            rel = path[len("/downloads"):]  # "" or "/file"
+            rel = rel.lstrip("/")
+            base = self.downloads_root
+        else:
+            rel = path.lstrip("/")
+            base = self.web_root
+
+        candidate = (base / rel).resolve()
+
+        # Jail to base (block traversal)
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            return str(base)  # fall back to base (will 404 or list base)
+
+        return str(candidate)
+
+    def log_message(self, format, *args):
+        # Keep default logging format, but you can tweak if desired.
+        super().log_message(format, *args)
+
+
 def serve_http(port: int) -> None:
-    os.chdir(WEB_DIR)
-    handler = http.server.SimpleHTTPRequestHandler
+    handler = RootedHandler
+    handler.web_root = WEB_DIR.resolve()
+    handler.downloads_root = DOWNLOADS_DIR.resolve()
+
     with ThreadingTCPServer(("", port), handler) as httpd:
         print(f"[+] HTTP  serving {WEB_DIR} on port {port}")
         print(f"[+] URL: http://0.0.0.0:{port}")
+        print(f"[+] Downloads: http://0.0.0.0:{port}/downloads/")
         httpd.serve_forever()
 
 
 def serve_https(port: int, cert_path: Path, key_path: Path) -> None:
-    os.chdir(WEB_DIR)
-    handler = http.server.SimpleHTTPRequestHandler
+    handler = RootedHandler
+    handler.web_root = WEB_DIR.resolve()
+    handler.downloads_root = DOWNLOADS_DIR.resolve()
+
     with ThreadingTCPServer(("", port), handler) as httpd:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         print(f"[+] HTTPS serving {WEB_DIR} on port {port}")
         print(f"[+] URL: https://0.0.0.0:{port}")
+        print(f"[+] Downloads: https://0.0.0.0:{port}/downloads/")
         httpd.serve_forever()
 
-def resolve_https_paths(cert_arg: Optional[str], key_arg: Optional[str]) -> Tuple[Path, Path]:
-    """
-    If user provided --cert/--key, use those.
-    Otherwise use defaults in ./certs if present.
-    """
-    if cert_arg or key_arg:
-        if not (cert_arg and key_arg):
-            raise ValueError("If you pass --cert you must also pass --key (and vice versa).")
-        return Path(cert_arg), Path(key_arg)
-
-    if DEFAULT_CERT_FILE.exists() and DEFAULT_KEY_FILE.exists():
-        return DEFAULT_CERT_FILE, DEFAULT_KEY_FILE
-
-    raise FileNotFoundError(
-        "HTTPS requested but no cert/key provided and default files are missing.\n"
-        "Expected defaults:\n"
-        "  - {0}\n"
-        "  - {1}\n"
-        "Or pass:\n"
-        "  --cert /path/to/full_chain.crt --key /path/to/private_key.key".format(
-            DEFAULT_CERT_FILE, DEFAULT_KEY_FILE
-        )
-    )
 
 def main() -> int:
-
     # Require root privileges (needed for ports 80 / 443)
     if os.name != "nt":  # Only enforce on Unix-like systems
         if os.geteuid() != 0:
@@ -249,7 +279,7 @@ def main() -> int:
             return 1
 
     p = argparse.ArgumentParser(description="Setup and optionally run a simple static site over HTTP and/or HTTPS.")
-    p.add_argument("--overwrite", action="store_true", help="Overwrite existing index.html and certs/README.txt")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing index.html")
     p.add_argument("--run-http", action="store_true", help="Run HTTP server")
     p.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT, help="HTTP port")
     p.add_argument("--run-https", action="store_true", help="Run HTTPS server")
@@ -260,12 +290,10 @@ def main() -> int:
 
     ensure_structure(overwrite=args.overwrite)
 
-    # --- resolve cert/key only when HTTPS is requested (Python 3.x compatible) ---
     cert_path = None
     key_path = None
 
     if args.run_https:
-        # If user passed --cert/--key, use them. Otherwise fall back to defaults if both exist.
         if args.cert is not None or args.key is not None:
             if not (args.cert and args.key):
                 print("[!] If you pass --cert you must also pass --key (and vice versa).")
@@ -285,7 +313,6 @@ def main() -> int:
                 print("      --cert /path/to/full_chain.crt --key /path/to/private_key.key")
                 return 2
 
-        # Resolve to absolute paths for clearer logs and to avoid cwd surprises
         cert_path = cert_path.resolve()
         key_path = key_path.resolve()
 
@@ -329,6 +356,7 @@ def main() -> int:
         print("[!] SSL error: {0}".format(e))
         print("[!] Common causes: wrong file format (not PEM), key doesn't match cert, missing intermediates in full chain.")
         return 3
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
